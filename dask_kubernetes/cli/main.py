@@ -12,10 +12,11 @@ import sys
 import time
 import traceback
 import webbrowser
+from glob import glob
 
 from .config import setup_logging
 from .utils import (call, check_output, required_commands, get_conf, makedirs,
-                    render_templates, write_templates, pardir, load_config)
+                    render_templates, write_templates, pardir, load_config, maybe_render_from_env)
 
 
 logger = logging.getLogger(__name__)
@@ -96,7 +97,23 @@ def create(ctx, name, settings_file, set, nowait):
     logger.info("Copying template config to %s" % par)
     makedirs(par, exist_ok=True)
     write_templates(render_templates(conf, par))
-    call("kubectl create -f {0}  --save-config".format(par))
+    config_files = glob(os.path.join(par, '*.yaml'))
+
+    # create secrets first then rest of the components
+    if len(conf['secrets']):
+        call("kubectl create -f {0}/secrets.yaml  --save-config".format(par))
+        config_files.remove('{0}/secrets.yaml'.format(par))
+    if conf['regsecret'] is not None:
+        regsecret_data = {k: maybe_render_from_env(k, v)
+                          for k, v in conf['regsecret'].items()}
+        logger.info("Creating regsecret with username {}"
+                    .format(regsecret_data['username']))
+        call('kubectl create secret docker-registry regsecret --docker-server="{server}"'
+             ' --docker-username={username} --docker-password={password} --docker-email={email}'
+            .format(**regsecret_data)
+        )
+    for config_path in config_files:
+        call("kubectl create -f {0}  --save-config".format(config_path))
     if not nowait:
         wait_until_ready(name, context)
         print_info(name, context)
@@ -351,6 +368,27 @@ def counts(cluster):
     lines = [o for o in out.split('\n') if o.startswith('dask-worker')]
     pods = int(lines[0].split()[1])
     return nodes, pods
+
+
+@cli.command(short_help='Execute command on multiple pods')
+@click.pass_context
+@click.argument('cluster', required=True)
+@click.argument('pattern', default='.*')
+@click.argument('command', required=True)
+def podexec(ctx, cluster, pattern, command, dryrun):
+    context = get_context_from_settings(cluster)
+    live_pods, _ = get_pods(context)
+    live_pods = [item for sublist in live_pods.values() for item in sublist]
+    exec_pods = filter(lambda x: bool(re.match(pattern , x)), live_pods)
+
+    for pod in exec_pods:
+        logger.info('Executing command in {}'.format(pod))
+        if not dryrun:
+            out = check_output('kubectl --context {context} exec --pod {pod} {cmd}'
+                               .format(context=context,
+                                       pod=pod,
+                                       cmd=command))
+            logger.info(out)
 
 
 @cli.command(short_help='Open the remote kubernetes console in the browser')
